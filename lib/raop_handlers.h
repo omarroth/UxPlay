@@ -1,5 +1,6 @@
 /**
  *  Copyright (C) 2018  Juho Vähä-Herttua
+ *  Copyright (C) 2026  Omar Roth
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public
@@ -23,7 +24,7 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <inttypes.h>
-#include <openssl/evp.h>
+#include "sdp.h"
 #include <plist/plist.h>
 #define AUDIO_SAMPLE_RATE 44100   /* all supported AirPlay audio format use this sample rate */
 #define SECOND_IN_USECS 1000000
@@ -557,41 +558,38 @@ raop_handler_fpsetup(raop_conn_t *conn,
     int datalen = 0;
 
     data = (unsigned char *) http_request_get_data(request, &datalen);
-    if (datalen == 16) {
-        if (data[4] != 0x02 && data[4] != 0x03) {
-            logger_log(raop->logger, LOGGER_ERR, " Client sent an unsupported type 0x%02x FairPlay challenge:\n"
-            "Only types 0x02 and 0x03 are supported", data[4]);
-            http_response_init(response, "RTSP/1.0", 501, "Not Implemented");
-            return;
-        }  
-
-        *response_data = calloc(142, sizeof(char));
-        if (*response_data) {
-            http_response_add_header(response, "Content-Type", "application/octet-stream");
-            if (!fairplay_setup(conn->fairplay, data, (unsigned char *) *response_data)) {
-                *response_datalen = 142;
-            } else {
-                // Handle error?
-                free(*response_data);
-                *response_data = NULL;
-            }
-        }
-    } else if (datalen == 164) {
-        *response_data = calloc(32, sizeof(char));
-        if (*response_data) {
-            http_response_add_header(response, "Content-Type", "application/octet-stream");
-            if (!fairplay_handshake(conn->fairplay, data, (unsigned char *) *response_data)) {
-                *response_datalen = 32;
-            } else {
-                // Handle error?
-                free(*response_data);
-                *response_data = NULL;
-            }
-        }
-    } else {
+    if (!data || (datalen != 16 && datalen != 164)) {
         logger_log(raop->logger, LOGGER_ERR, "Invalid fp-setup data length");
+        http_response_init(response, "RTSP/1.0", 400, "Bad Request");
         return;
     }
+    if (data[4] != 0x02 && data[4] != 0x03) {
+        logger_log(raop->logger, LOGGER_ERR, "Unsupported FairPlay version 0x%02x", data[4]);
+        http_response_init(response, "RTSP/1.0", 501, "Not Implemented");
+        return;
+    }
+
+    int reply_len = datalen == 16 ? 142 : 32;
+    char *reply = calloc(reply_len, sizeof(char));
+    if (!reply) {
+        http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+        return;
+    }
+    int ret = datalen == 16 ? fairplay_setup(conn->fairplay, data, (unsigned char *) reply) :
+                             fairplay_handshake(conn->fairplay, data, (unsigned char *) reply);
+    if (ret != 0) {
+        logger_log(raop->logger, LOGGER_ERR, "FairPlay v%d setup failed (%d)", data[4], ret);
+        free(reply);
+        if (ret == -1) {
+            http_response_init(response, "RTSP/1.0", 400, "Bad Request");
+        } else {
+            http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+        }
+        return;
+    }
+    http_response_add_header(response, "Content-Type", "application/octet-stream");
+    *response_data = reply;
+    *response_datalen = reply_len;
 }
 
 static void
@@ -725,67 +723,6 @@ raop_handler_authorize(raop_conn_t *conn, http_request_t *request,
     return true;
 }
 
-/* SDP uses base64 with optional trailing padding. */
-static bool
-raop_decode_sdp_key(const char *value, unsigned char *output, size_t output_len)
-{
-    char encoded[97];
-    unsigned char decoded[72];
-    size_t len = strlen(value), padded_len = (len + 3) & ~(size_t) 3;
-    if (!len || padded_len > sizeof(encoded) - 1 || len % 4 == 1) {
-        return false;
-    }
-    size_t padding_start = strcspn(value, "=");
-    for (size_t i = 0; i < padding_start; i++) {
-        unsigned char c = (unsigned char) value[i];
-        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-              (c >= '0' && c <= '9') || c == '+' || c == '/')) {
-            return false;
-        }
-    }
-    for (size_t i = padding_start; i < len; i++) {
-        if (value[i] != '=') {
-            return false;
-        }
-    }
-    if (padded_len - padding_start > 2) {
-        return false;
-    }
-    memcpy(encoded, value, len);
-    memset(encoded + len, '=', padded_len - len);
-    encoded[padded_len] = '\0';
-    int decoded_len = EVP_DecodeBlock(decoded, (unsigned char *) encoded, (int) padded_len);
-    if (decoded_len < 0 || (size_t) decoded_len - (padded_len - padding_start) != output_len) {
-        return false;
-    }
-    memcpy(output, decoded, output_len);
-    return true;
-}
-
-static bool
-raop_sdp_alac_format(const char *rtpmap, const char *fmtp)
-{
-    unsigned int payload;
-    char codec[32], extra;
-    if (sscanf(rtpmap, "%3u %31s %c", &payload, codec, &extra) != 2 ||
-        payload < 96 || payload > 127 || strcmp(codec, "AppleLossless")) {
-        return false;
-    }
-    /* The renderer's ALAC cookie is fixed to 352 samples, 16-bit stereo,
-     * 44.1 kHz. Reject other configurations instead of decoding them incorrectly. */
-    const unsigned int format[] = {payload, 352, 0, 16, 40, 10, 14, 2, 255, 0, 0, AUDIO_SAMPLE_RATE};
-    for (size_t i = 0; i < sizeof(format) / sizeof(format[0]); i++) {
-        while (isspace((unsigned char) *fmtp)) fmtp++;
-        if (*fmtp < '0' || *fmtp > '9') return false;
-        char *end = NULL;
-        unsigned long value = strtoul(fmtp, &end, 10);
-        if (value != format[i] || (*end && !isspace((unsigned char) *end))) return false;
-        fmtp = end;
-    }
-    while (isspace((unsigned char) *fmtp)) fmtp++;
-    return *fmtp == '\0';
-}
-
 static void
 raop_handler_announce(raop_conn_t *conn,
                       http_request_t *request, http_response_t *response,
@@ -799,49 +736,31 @@ raop_handler_announce(raop_conn_t *conn,
         http_response_init(response, "RTSP/1.0", 415, "Unsupported Media Type");
         return;
     }
-    if (!data || datalen <= 0 || memchr(data, '\0', datalen)) {
-        http_response_init(response, "RTSP/1.0", 400, "Bad Request");
-        return;
-    }
     if (conn->raop_rtp || conn->raop_ntp || conn->raop_rtp_mirror) {
         http_response_init(response, "RTSP/1.0", 455, "Method Not Valid in This State");
         return;
     }
-    char *sdp = malloc((size_t) datalen + 1);
-    if (!sdp) {
-        http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
-        return;
-    }
-    memcpy(sdp, data, datalen);
-    sdp[datalen] = '\0';
-    const char *prefixes[] = {"a=rtpmap:", "a=fmtp:", "a=fpaeskey:", "a=aesiv:"};
-    char *values[4] = {NULL};
-    char *current = sdp, *line;
-    bool valid = true;
-    while ((line = utils_strsep(&current, "\r\n"))) {
-        for (size_t i = 0; i < 4; i++) {
-            if (!strncmp(line, prefixes[i], strlen(prefixes[i]))) {
-                if (values[i]) valid = false;
-                values[i] = line + strlen(prefixes[i]);
-            }
+    sdp_audio_t audio;
+    int ret = sdp_parse_audio(data, datalen, &audio);
+    if (ret != SDP_AUDIO_OK) {
+        if (ret == SDP_AUDIO_NOMEM) {
+            http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+        } else if (ret == SDP_AUDIO_UNSUPPORTED) {
+            http_response_init(response, "RTSP/1.0", 415, "Unsupported Media Type");
+        } else {
+            http_response_init(response, "RTSP/1.0", 400, "Bad Request");
         }
-    }
-    unsigned char ekey[EKEY_SIZE], aeskey[AES_KEY_SIZE], aesiv[AES_IV_SIZE];
-    if (!valid || !values[0] || !values[1] || !values[2] || !values[3] ||
-        !raop_decode_sdp_key(values[2], ekey, sizeof(ekey)) ||
-        !raop_decode_sdp_key(values[3], aesiv, sizeof(aesiv))) {
-        http_response_init(response, "RTSP/1.0", 400, "Bad Request");
-        goto finish_announce;
-    }
-    if (!raop_sdp_alac_format(values[0], values[1])) {
-        http_response_init(response, "RTSP/1.0", 415, "Unsupported Media Type");
-        goto finish_announce;
+        return;
     }
     char remote[40] = {0};
     utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id, remote, sizeof(remote));
     const char *client_id = http_request_get_header(request, "Client-Instance");
-    if (!client_id) client_id = remote;
-    if (!raop_handler_authorize(conn, request, response, client_id)) goto finish_announce;
+    if (!client_id) {
+        client_id = remote;
+    }
+    if (!raop_handler_authorize(conn, request, response, client_id)) {
+        return;
+    }
     bool admit_client = true;
     if (raop->callbacks.report_client_request) {
         char *name = (char *) http_request_get_header(request, "User-Agent");
@@ -850,21 +769,20 @@ raop_handler_announce(raop_conn_t *conn,
     }
     if (!admit_client) {
         http_response_init(response, "RTSP/1.0", 401, "Unauthorized");
-        goto finish_announce;
+        return;
     }
-    int ret = fairplay_decrypt(conn->fairplay, ekey, aeskey);
+    unsigned char aeskey[AES_KEY_SIZE];
+    ret = fairplay_decrypt(conn->fairplay, audio.ekey, aeskey);
     if (ret != 0) {
         logger_log(raop->logger, LOGGER_ERR, "ANNOUNCE: FairPlay audio key unwrap failed (%d)", ret);
         http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
-        goto finish_announce;
+        return;
     }
     /* Classic RAOP uses this key directly, without the mirroring ECDH hash. */
     memcpy(conn->audio_key, aeskey, sizeof(aeskey));
-    memcpy(conn->audio_iv, aesiv, sizeof(aesiv));
+    memcpy(conn->audio_iv, audio.iv, sizeof(audio.iv));
     conn->audio_announced = true;
     logger_log(raop->logger, LOGGER_DEBUG, "ANNOUNCE: ALAC 44100/16/2, 352 samples per frame");
-finish_announce:
-    free(sdp);
 }
 
 static bool
@@ -874,14 +792,24 @@ raop_transport_port(const char *transport, const char *name, unsigned short *por
     bool found = false;
     while ((field = strchr(field, ';'))) {
         field++;
-        while (*field == ' ' || *field == '\t') field++;
-        if (strncmp(field, name, strlen(name))) continue;
+        while (*field == ' ' || *field == '\t') {
+            field++;
+        }
+        if (strncmp(field, name, strlen(name))) {
+            continue;
+        }
         const char *value = field + strlen(name);
-        if (found || *value < '0' || *value > '9') return false;
+        if (found || *value < '0' || *value > '9') {
+            return false;
+        }
         char *end = NULL;
         unsigned long number = strtoul(value, &end, 10);
-        while (*end == ' ' || *end == '\t') end++;
-        if (!number || number > 65535 || (*end && *end != ';')) return false;
+        while (*end == ' ' || *end == '\t') {
+            end++;
+        }
+        if (!number || number > 65535 || (*end && *end != ';')) {
+            return false;
+        }
         *port = (unsigned short) number;
         found = true;
     }
@@ -893,7 +821,7 @@ raop_handler_setup_audio(raop_conn_t *conn, http_request_t *request,
                          http_response_t *response, const char *transport)
 {
     raop_t *raop = conn->raop;
-    if (!conn->audio_announced || conn->raop_rtp || conn->raop_ntp) {
+    if (!conn->audio_announced || conn->raop_rtp || conn->raop_ntp || conn->raop_rtp_mirror) {
         http_response_init(response, "RTSP/1.0", 455, "Method Not Valid in This State");
         return;
     }
@@ -916,14 +844,22 @@ raop_handler_setup_audio(raop_conn_t *conn, http_request_t *request,
     unsigned short tport = raop->timing_lport, cport = raop->control_lport, dport = raop->data_lport;
     conn->raop_ntp = raop_ntp_init(raop->logger, &raop->callbacks, remote,
                                   conn->remotelen, remote_tport, &protocol);
-    if (!conn->raop_ntp) goto setup_audio_failed;
-    if (raop_ntp_start(conn->raop_ntp, &tport) < 0) goto setup_audio_failed;
+    if (!conn->raop_ntp) {
+        goto setup_audio_failed;
+    }
+    if (raop_ntp_start(conn->raop_ntp, &tport) < 0) {
+        goto setup_audio_failed;
+    }
     conn->raop_rtp = raop_rtp_init(raop->logger, &raop->callbacks, conn->raop_ntp,
                                   remote, conn->remotelen, conn->audio_key, conn->audio_iv);
-    if (!conn->raop_rtp) goto setup_audio_failed;
+    if (!conn->raop_rtp) {
+        goto setup_audio_failed;
+    }
     const char *dacp_id = http_request_get_header(request, "DACP-ID");
     const char *active_remote = http_request_get_header(request, "Active-Remote");
-    if (dacp_id && active_remote) raop_rtp_remote_control_id(conn->raop_rtp, dacp_id, active_remote);
+    if (dacp_id && active_remote) {
+        raop_rtp_remote_control_id(conn->raop_rtp, dacp_id, active_remote);
+    }
     unsigned char ct = 2;
     unsigned short spf = 352;
     unsigned int sr = AUDIO_SAMPLE_RATE;
@@ -934,7 +870,9 @@ raop_handler_setup_audio(raop_conn_t *conn, http_request_t *request,
                                          &using_screen, &is_media, &audio_format);
     }
     raop_rtp_start_audio(conn->raop_rtp, &remote_cport, &cport, &dport, &ct, &sr);
-    if (!raop_rtp_is_running(conn->raop_rtp)) goto setup_audio_failed;
+    if (!raop_rtp_is_running(conn->raop_rtp)) {
+        goto setup_audio_failed;
+    }
     char buffer[160];
     snprintf(buffer, sizeof(buffer), "RTP/AVP/UDP;unicast;mode=record;server_port=%hu;control_port=%hu;timing_port=%hu",
              dport, cport, tport);
@@ -1078,13 +1016,22 @@ raop_handler_setup(raop_conn_t *conn,
         free(eiv);	
         free(ekey);
         if (ret < 0) {
-            logger_log(raop->logger, LOGGER_ERR, "SETUP 1: invalid EIV and/or EKEY: sizes (&d,%d) != (16,72)", eiv, ekey);
+            logger_log(raop->logger, LOGGER_ERR, "SETUP 1: invalid EIV/EKEY sizes (%" PRIu64 ",%" PRIu64 ") != (16,72)", eiv_len, ekey_len);
+            plist_free(req_root_node);
+            plist_free(res_root_node);
             http_response_init(response, "RTSP/1.0", 400, "Bad Request");
             return;
         }
 
         ret = fairplay_decrypt(conn->fairplay, (unsigned char*) eaeskey, aeskey);
         logger_log(raop->logger, LOGGER_DEBUG, "fairplay_decrypt ret = %d", ret);
+        if (ret != 0) {
+            logger_log(raop->logger, LOGGER_ERR, "SETUP: FairPlay audio key unwrap failed (%d)", ret);
+            plist_free(req_root_node);
+            plist_free(res_root_node);
+            http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+            return;
+        }
         if (logger_debug) {
             char *str = utils_data_to_string(aeskey, 16, 16);
             logger_log(raop->logger, LOGGER_DEBUG, "16 byte aeskey (fairplay-decrypted from ekey):\n%s", str);
@@ -1189,6 +1136,10 @@ raop_handler_setup(raop_conn_t *conn,
         conn->raop_ntp = NULL;
         conn->raop_rtp = NULL;
         conn->raop_rtp_mirror = NULL;
+        /* Plist clients send explicit /feedback requests. Classic RAOP uses
+         * RTP and timing traffic as heartbeats instead. */
+        raop_callbacks_t media_callbacks = raop->callbacks;
+        media_callbacks.conn_feedback = NULL;
         char remote[40] = { 0 };
         int len = utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id, remote, (int) sizeof(remote));
         if (!len || len > (int) sizeof(remote)) {
@@ -1199,10 +1150,10 @@ raop_handler_setup(raop_conn_t *conn,
                        conn->remotelen, conn->zone_id, str, remote);
             free(str);
         }
-        conn->raop_ntp = raop_ntp_init(raop->logger, &raop->callbacks, remote,
+        conn->raop_ntp = raop_ntp_init(raop->logger, &media_callbacks, remote,
                                        conn->remotelen, (unsigned short) timing_rport, &time_protocol);
         raop_ntp_start(conn->raop_ntp, &timing_lport);
-        conn->raop_rtp = raop_rtp_init(raop->logger, &raop->callbacks, conn->raop_ntp,
+        conn->raop_rtp = raop_rtp_init(raop->logger, &media_callbacks, conn->raop_ntp,
                                        remote, conn->remotelen, aeskey, aesiv);
         conn->raop_rtp_mirror = raop_rtp_mirror_init(raop->logger, &raop->callbacks,
                                                      conn->raop_ntp, remote, conn->remotelen, aeskey);

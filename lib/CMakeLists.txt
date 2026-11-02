@@ -60,11 +60,6 @@ add_library( airplay  STATIC
              ${DIR_SRCS}
            )
 
-# Development-only FairPlay selector-2 receiver experiment.
-target_sources(airplay PRIVATE
-    fairplay_v2.c
-    fairplay_v2_helper.c)
-
 if ( APPLE )
   target_link_libraries( airplay 
                          pthread

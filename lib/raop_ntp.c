@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2019 dsafa22 and 2014 Joakim Plate, modified by Florian Draschbacher,
+ * Copyright (C) 2026  Omar Roth
  * All Rights Reserved.
  *
  * This library is free software; you can redistribute it and/or
@@ -740,6 +741,9 @@ raop_ntp_thread(void *arg) {
                 }
 
                 if (!bogus_ntp_packet && !duplicate_ntp_packet) {
+                    if (raop_ntp->callbacks.conn_feedback) {
+                        raop_ntp->callbacks.conn_feedback(raop_ntp->callbacks.cls);
+                    }
                     /* ntp metrics as seconds (as doubles) */
                     double total_time = ntp_diff_to_seconds(t4,t1);
                     double client_process_time = ntp_diff_to_seconds(t3,t2);

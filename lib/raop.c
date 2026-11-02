@@ -1,4 +1,5 @@
 /**  Copyright (C) 2011-2012  Juho Vähä-Herttua
+ *  Copyright (C) 2026  Omar Roth
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public
@@ -147,11 +148,7 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
     conn->raop_rtp = NULL;
     conn->raop_rtp_mirror = NULL;
     conn->raop_ntp = NULL;
-    int hw_addr_len = 0;
-    const char *hw_addr = dnssd_get_hw_addr(raop->dnssd, &hw_addr_len);
-    conn->fairplay = fairplay_init(raop->logger,
-                                   (const unsigned char *) hw_addr,
-                                   (size_t) hw_addr_len);
+    conn->fairplay = fairplay_init(raop->logger);
 
     if (!conn->fairplay) {
         free(conn);
@@ -490,6 +487,10 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 
     if (handler != NULL) {
         handler(conn, request, *response, &response_data, &response_datalen);
+        if (conn->audio_announced && raop->callbacks.conn_feedback) {
+            /* Classic RAOP does not send the plist protocol's /feedback. */
+            raop->callbacks.conn_feedback(raop->callbacks.cls);
+        }
     } else {
         logger_log(raop->logger, LOGGER_INFO,
                    "Unhandled Client Request: %s %s %s", method, url, protocol);
