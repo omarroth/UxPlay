@@ -18,6 +18,8 @@
 #ifndef DNSSDINT_H
 #define DNSSDINT_H
 
+#include <stdlib.h>
+
 #include "global.h"
 
 /* the previous behavior of announcing UxPlay with a fixed public key PK

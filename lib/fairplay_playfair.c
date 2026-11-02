@@ -17,6 +17,8 @@
 #include <assert.h>
 
 #include "fairplay.h"
+#include "fairplay_v2.h"
+#include "fairplay_v2_helper.h"
 #include "playfair/playfair.h"
 
 char reply_message[4][142] = {{0x46,0x50,0x4c,0x59,0x03,0x01,0x02,0x00,0x00,0x00,0x00,0x82,0x02,0x00,0x0f,0x9f,0x3f,0x9e,0x0a,0x25,0x21,0xdb,0xdf,0x31,0x2a,0xb2,0xbf,0xb2,0x9e,0x8d,0x23,0x2b,0x63,0x76,0xa8,0xc8,0x18,0x70,0x1d,0x22,0xae,0x93,0xd8,0x27,0x37,0xfe,0xaf,0x9d,0xb4,0xfd,0xf4,0x1c,0x2d,0xba,0x9d,0x1f,0x49,0xca,0xaa,0xbf,0x65,0x91,0xac,0x1f,0x7b,0xc6,0xf7,0xe0,0x66,0x3d,0x21,0xaf,0xe0,0x15,0x65,0x95,0x3e,0xab,0x81,0xf4,0x18,0xce,0xed,0x09,0x5a,0xdb,0x7c,0x3d,0x0e,0x25,0x49,0x09,0xa7,0x98,0x31,0xd4,0x9c,0x39,0x82,0x97,0x34,0x34,0xfa,0xcb,0x42,0xc6,0x3a,0x1c,0xd9,0x11,0xa6,0xfe,0x94,0x1a,0x8a,0x6d,0x4a,0x74,0x3b,0x46,0xc3,0xa7,0x64,0x9e,0x44,0xc7,0x89,0x55,0xe4,0x9d,0x81,0x55,0x00,0x95,0x49,0xc4,0xe2,0xf7,0xa3,0xf6,0xd5,0xba},
@@ -31,16 +33,29 @@ struct fairplay_s {
 
     unsigned char keymsg[164];
     unsigned int keymsglen;
+    unsigned int version;
+    fairplay_v2_t *v2;
+    fairplay_v2_helper_t *v2_helper;
+    char hardware_id_hex[13];
 };
 
 fairplay_t *
-fairplay_init(logger_t *logger)
+fairplay_init(logger_t *logger, const unsigned char *hardware_id,
+              size_t hardware_id_length)
 {
     fairplay_t *fp = calloc(1, sizeof(fairplay_t));
+    static const char hex[] = "0123456789abcdef";
+    size_t i;
     if (!fp) {
         return NULL;
     }
     fp->logger = logger;
+    if (hardware_id && hardware_id_length == 6) {
+        for (i = 0; i < hardware_id_length; i++) {
+            fp->hardware_id_hex[2 * i] = hex[hardware_id[i] >> 4];
+            fp->hardware_id_hex[2 * i + 1] = hex[hardware_id[i] & 15];
+        }
+    }
 
     return fp;
 }
@@ -50,7 +65,43 @@ fairplay_setup(fairplay_t *fp, const unsigned char req[16], unsigned char res[14
 {
     assert(fp);
 
-    if (req[4] != 0x03) {
+    if (req[4] == 0x02) {
+        const char *helper_command = getenv("UXPLAY_FAIRPLAY_V2_HELPER");
+        const char *hardware_id = getenv("UXPLAY_FAIRPLAY_V2_HWID");
+        size_t response_length = 0;
+        fairplay_v2_free(fp->v2);
+        fp->v2 = NULL;
+        fairplay_v2_helper_free(fp->v2_helper);
+        fp->v2_helper = NULL;
+        if (helper_command && helper_command[0]) {
+            if (!hardware_id || strlen(hardware_id) != 12) {
+                hardware_id = fp->hardware_id_hex;
+            }
+            if (strlen(hardware_id) != 12) {
+                return -1;
+            }
+            fp->v2_helper = fairplay_v2_helper_new(helper_command, hardware_id);
+            if (!fp->v2_helper ||
+                fairplay_v2_helper_exchange(fp->v2_helper, req, 16, res,
+                                            142, &response_length) != 0 ||
+                response_length != 142) {
+                return -1;
+            }
+        } else {
+            fp->v2 = fairplay_v2_new();
+            if (!fp->v2) {
+                return -1;
+            }
+            if (fairplay_v2_setup(fp->v2, req, res) != 0) {
+                return -1;
+            }
+        }
+        fp->keymsglen = 0;
+        fp->version = 2;
+        return 0;
+    }
+
+    if (req[4] != 0x03 || req[14] >= 4) {
         /* Unsupported fairplay version */
         return -1;
     }
@@ -58,6 +109,7 @@ fairplay_setup(fairplay_t *fp, const unsigned char req[16], unsigned char res[14
     int mode = req[14];
     memcpy(res, reply_message[mode], 142);
     fp->keymsglen = 0;
+    fp->version = 3;
     return 0;
 }
 
@@ -66,7 +118,17 @@ fairplay_handshake(fairplay_t *fp, const unsigned char req[164], unsigned char r
 {
     assert(fp);
 
-    if (req[4] != 0x03) {
+    if (req[4] == 0x02 && fp->version == 2 && fp->v2) {
+        return fairplay_v2_handshake(fp->v2, req, res);
+    }
+    if (req[4] == 0x02 && fp->version == 2 && fp->v2_helper) {
+        size_t response_length = 0;
+        int result = fairplay_v2_helper_exchange(fp->v2_helper, req, 164,
+                                                 res, 32, &response_length);
+        return result == 0 && response_length == 32 ? 0 : -1;
+    }
+
+    if (req[4] != 0x03 || fp->version != 3) {
         /* Unsupported fairplay version */
         return -1;
     }
@@ -82,6 +144,12 @@ fairplay_handshake(fairplay_t *fp, const unsigned char req[164], unsigned char r
 int
 fairplay_decrypt(fairplay_t *fp, const unsigned char input[72], unsigned char output[16])
 {
+    if (fp->version == 2 && fp->v2) {
+        return fairplay_v2_decrypt_key(fp->v2, input, output);
+    }
+    if (fp->version == 2 && fp->v2_helper) {
+        return fairplay_v2_helper_unwrap(fp->v2_helper, input, output);
+    }
     if (fp->keymsglen != 164) {
         return -1;
     }
@@ -93,5 +161,9 @@ fairplay_decrypt(fairplay_t *fp, const unsigned char input[72], unsigned char ou
 void
 fairplay_destroy(fairplay_t *fp)
 {
+    if (fp) {
+        fairplay_v2_free(fp->v2);
+        fairplay_v2_helper_free(fp->v2_helper);
+    }
     free(fp);
 }

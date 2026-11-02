@@ -23,6 +23,7 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <openssl/evp.h>
 #include <plist/plist.h>
 #define AUDIO_SAMPLE_RATE 44100   /* all supported AirPlay audio format use this sample rate */
 #define SECOND_IN_USECS 1000000
@@ -557,9 +558,9 @@ raop_handler_fpsetup(raop_conn_t *conn,
 
     data = (unsigned char *) http_request_get_data(request, &datalen);
     if (datalen == 16) {
-        if (data[4] != 0x03) {
+        if (data[4] != 0x02 && data[4] != 0x03) {
             logger_log(raop->logger, LOGGER_ERR, " Client sent an unsupported type 0x%02x FairPlay challenge:\n"
-            "Only type 0x03 can be handled using publically-available information", data[4]);
+            "Only types 0x02 and 0x03 are supported", data[4]);
             http_response_init(response, "RTSP/1.0", 501, "Not Implemented");
             return;
         }  
@@ -598,18 +599,370 @@ raop_handler_options(raop_conn_t *conn,
                      http_request_t *request, http_response_t *response,
                      char **response_data, int *response_datalen)
 {
-    http_response_add_header(response, "Public", "SETUP, RECORD, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER");
+    http_response_add_header(response, "Public", "ANNOUNCE, SETUP, RECORD, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER");
 }
 
 #define AES_IV_SIZE 16
 #define EKEY_SIZE 72
 #define AES_KEY_SIZE 16
 
+/* Shared by SDP ANNOUNCE and the binary-plist SETUP flow. */
+static bool
+raop_handler_authorize(raop_conn_t *conn, http_request_t *request,
+                       http_response_t *response, const char *deviceID)
+{
+    raop_t *raop = conn->raop;
+    if (!deviceID) {
+        deviceID = "";
+    }
+    /* RFC2617 Digest authentication (md5 hash) of uxplay client-access password, if set */
+    if (!conn->authenticated && raop->callbacks.passwd) {
+        size_t pin_len = 4;
+        const char *authorization = NULL;
+        authorization = http_request_get_header(request, "Authorization");
+        if (!authorization) {
+            // if random_pw is set, but client has changed, unset it
+            if (raop->random_pw && strncmp(raop->random_pw + pin_len + 1,  deviceID, 17)) {
+                free(raop->random_pw);
+                raop->random_pw = NULL;
+            }
+        }
+        int len = 0;
+        const char *password = raop->callbacks.passwd(raop->callbacks.cls, &len);
+        // len = -1 means use a random password for this connection; len = 0 means no password
+        if (len == -1 && raop->random_pw && raop->auth_fail_count >= MAX_PW_ATTEMPTS) {
+            // change random_pw after MAX_PW_ATTEMPTS  failed authentication attempts
+            logger_log(raop->logger, LOGGER_INFO, "Too many authentication failures: generate new random password");
+            free(raop->random_pw);
+            raop->random_pw = NULL;
+        }
+        if (len == -1 && !raop->random_pw) {
+            // get and store 4 random digits
+            int pin_4  = random_pin();
+            if (pin_4 < 0) {
+                logger_log(raop->logger, LOGGER_ERR, "Failed to generate random pin");
+                pin_4 = 1234;
+            }
+            if ((raop->random_pw =  (char *) calloc(pin_len + 1 + 18, sizeof(char)))) {
+                char *pin = raop->random_pw;
+                snprintf(pin, pin_len + 1, "%04u", pin_4 % 10000);
+                pin[pin_len] = '\0';
+                snprintf(pin + pin_len + 1, 18, "%s", deviceID);
+            } else {
+                logger_log(raop->logger, LOGGER_ERR, "Failed to allocate raop->random_pw");
+            }
+            raop->auth_fail_count = 0;
+        }
+        if (len == -1 && !authorization && raop->random_pw) {
+            if (raop->callbacks.display_pin) {
+                raop->callbacks.display_pin(raop->callbacks.cls, raop->random_pw);
+            }
+            logger_log(raop->logger, LOGGER_INFO, "*** CLIENT MUST NOW ENTER PIN = \"%s\" AS AIRPLAY PASSWORD", raop->random_pw);
+            raop->auth_fail_count++;
+        }
+        if (len && !conn->authenticated) {
+            if (len == -1) {
+                password = (const char *) raop->random_pw;
+            }
+            char nonce_string[33] = { '\0' };
+            //bool stale = false;  //not implemented
+            if (len && authorization) {
+                const char *nonce = strstr(authorization, "nonce=\"");
+                nonce = nonce ? nonce + strlen("nonce=\"") : NULL;
+                if (nonce) {
+                    const char *end = strchr(nonce, '\"');
+                    if (end && end == nonce + 32) {
+                        strncpy(nonce_string, nonce, 32);
+                    }
+                }
+                const char *method = http_request_get_method(request);
+                conn->authenticated = pairing_digest_verify(method, authorization, password);
+                if (!conn->authenticated) {
+                    // if random_pw is used, the auth_fail_count will be the number of times it is displayed after creation
+                    if (len != -1) {
+                        raop->auth_fail_count++;
+                    }
+                    logger_log(raop->logger, LOGGER_INFO, "*** authentication failure: count = %u", raop->auth_fail_count);
+                }
+                if (conn->authenticated) {
+                    //printf("initial authenticatication OK\n");
+                    conn->authenticated = raop->nonce && !strcmp(nonce_string, raop->nonce);
+                    if (!conn->authenticated) {
+                        logger_log(raop->logger, LOGGER_INFO, "authentication rejected (nonce mismatch) %s %s",
+                                   nonce_string, raop->nonce ? raop->nonce : "");
+                    }
+                }
+                if (conn->authenticated && raop->random_pw) {
+                    free (raop->random_pw);
+                    raop->random_pw = NULL;
+                }
+                if (raop->nonce) {
+                    free(raop->nonce);
+                    raop->nonce = NULL;
+                }
+                logger_log(raop->logger, LOGGER_INFO, "Client authentication %s", (conn->authenticated ? "success" : "failure"));
+            }
+            if (!conn->authenticated) {
+                /* create a nonce */
+                const char *url = http_request_get_url(request);
+                unsigned char nonce[16] = { '\0' };
+                int len = 16;
+                uint64_t now = raop_ntp_get_local_time();
+                pairing_session_make_nonce(conn->session, &now, url, nonce, len);
+                if (raop->nonce) {
+                    free(raop->nonce);
+                }
+                raop->nonce = utils_hex_to_string(nonce, len);
+                char response_text[80] = "Digest realm=\"raop\", nonce=\"";
+                strncat(response_text, raop->nonce, 80 - strlen(response_text) - 1);
+                strncat(response_text, "\"", 80 - strlen(response_text) - 1);
+                http_response_init(response, "RTSP/1.0", 401, "Unauthorized");
+                http_response_add_header(response, "WWW-Authenticate", response_text);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* SDP uses base64 with optional trailing padding. */
+static bool
+raop_decode_sdp_key(const char *value, unsigned char *output, size_t output_len)
+{
+    char encoded[97];
+    unsigned char decoded[72];
+    size_t len = strlen(value), padded_len = (len + 3) & ~(size_t) 3;
+    if (!len || padded_len > sizeof(encoded) - 1 || len % 4 == 1) {
+        return false;
+    }
+    size_t padding_start = strcspn(value, "=");
+    for (size_t i = 0; i < padding_start; i++) {
+        unsigned char c = (unsigned char) value[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '+' || c == '/')) {
+            return false;
+        }
+    }
+    for (size_t i = padding_start; i < len; i++) {
+        if (value[i] != '=') {
+            return false;
+        }
+    }
+    if (padded_len - padding_start > 2) {
+        return false;
+    }
+    memcpy(encoded, value, len);
+    memset(encoded + len, '=', padded_len - len);
+    encoded[padded_len] = '\0';
+    int decoded_len = EVP_DecodeBlock(decoded, (unsigned char *) encoded, (int) padded_len);
+    if (decoded_len < 0 || (size_t) decoded_len - (padded_len - padding_start) != output_len) {
+        return false;
+    }
+    memcpy(output, decoded, output_len);
+    return true;
+}
+
+static bool
+raop_sdp_alac_format(const char *rtpmap, const char *fmtp)
+{
+    unsigned int payload;
+    char codec[32], extra;
+    if (sscanf(rtpmap, "%3u %31s %c", &payload, codec, &extra) != 2 ||
+        payload < 96 || payload > 127 || strcmp(codec, "AppleLossless")) {
+        return false;
+    }
+    /* The renderer's ALAC cookie is fixed to 352 samples, 16-bit stereo,
+     * 44.1 kHz. Reject other configurations instead of decoding them incorrectly. */
+    const unsigned int format[] = {payload, 352, 0, 16, 40, 10, 14, 2, 255, 0, 0, AUDIO_SAMPLE_RATE};
+    for (size_t i = 0; i < sizeof(format) / sizeof(format[0]); i++) {
+        while (isspace((unsigned char) *fmtp)) fmtp++;
+        if (*fmtp < '0' || *fmtp > '9') return false;
+        char *end = NULL;
+        unsigned long value = strtoul(fmtp, &end, 10);
+        if (value != format[i] || (*end && !isspace((unsigned char) *end))) return false;
+        fmtp = end;
+    }
+    while (isspace((unsigned char) *fmtp)) fmtp++;
+    return *fmtp == '\0';
+}
+
+static void
+raop_handler_announce(raop_conn_t *conn,
+                      http_request_t *request, http_response_t *response,
+                      char **response_data, int *response_datalen)
+{
+    raop_t *raop = conn->raop;
+    const char *content_type = http_request_get_header(request, "Content-Type");
+    int datalen = 0;
+    const char *data = http_request_get_data(request, &datalen);
+    if (!content_type || strcmp(content_type, "application/sdp")) {
+        http_response_init(response, "RTSP/1.0", 415, "Unsupported Media Type");
+        return;
+    }
+    if (!data || datalen <= 0 || memchr(data, '\0', datalen)) {
+        http_response_init(response, "RTSP/1.0", 400, "Bad Request");
+        return;
+    }
+    if (conn->raop_rtp || conn->raop_ntp || conn->raop_rtp_mirror) {
+        http_response_init(response, "RTSP/1.0", 455, "Method Not Valid in This State");
+        return;
+    }
+    char *sdp = malloc((size_t) datalen + 1);
+    if (!sdp) {
+        http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+        return;
+    }
+    memcpy(sdp, data, datalen);
+    sdp[datalen] = '\0';
+    const char *prefixes[] = {"a=rtpmap:", "a=fmtp:", "a=fpaeskey:", "a=aesiv:"};
+    char *values[4] = {NULL};
+    char *current = sdp, *line;
+    bool valid = true;
+    while ((line = utils_strsep(&current, "\r\n"))) {
+        for (size_t i = 0; i < 4; i++) {
+            if (!strncmp(line, prefixes[i], strlen(prefixes[i]))) {
+                if (values[i]) valid = false;
+                values[i] = line + strlen(prefixes[i]);
+            }
+        }
+    }
+    unsigned char ekey[EKEY_SIZE], aeskey[AES_KEY_SIZE], aesiv[AES_IV_SIZE];
+    if (!valid || !values[0] || !values[1] || !values[2] || !values[3] ||
+        !raop_decode_sdp_key(values[2], ekey, sizeof(ekey)) ||
+        !raop_decode_sdp_key(values[3], aesiv, sizeof(aesiv))) {
+        http_response_init(response, "RTSP/1.0", 400, "Bad Request");
+        goto finish_announce;
+    }
+    if (!raop_sdp_alac_format(values[0], values[1])) {
+        http_response_init(response, "RTSP/1.0", 415, "Unsupported Media Type");
+        goto finish_announce;
+    }
+    char remote[40] = {0};
+    utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id, remote, sizeof(remote));
+    const char *client_id = http_request_get_header(request, "Client-Instance");
+    if (!client_id) client_id = remote;
+    if (!raop_handler_authorize(conn, request, response, client_id)) goto finish_announce;
+    bool admit_client = true;
+    if (raop->callbacks.report_client_request) {
+        char *name = (char *) http_request_get_header(request, "User-Agent");
+        raop->callbacks.report_client_request(raop->callbacks.cls, (char *) client_id,
+                                             "RAOP", name ? name : "Audio client", &admit_client);
+    }
+    if (!admit_client) {
+        http_response_init(response, "RTSP/1.0", 401, "Unauthorized");
+        goto finish_announce;
+    }
+    int ret = fairplay_decrypt(conn->fairplay, ekey, aeskey);
+    if (ret != 0) {
+        logger_log(raop->logger, LOGGER_ERR, "ANNOUNCE: FairPlay audio key unwrap failed (%d)", ret);
+        http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+        goto finish_announce;
+    }
+    /* Classic RAOP uses this key directly, without the mirroring ECDH hash. */
+    memcpy(conn->audio_key, aeskey, sizeof(aeskey));
+    memcpy(conn->audio_iv, aesiv, sizeof(aesiv));
+    conn->audio_announced = true;
+    logger_log(raop->logger, LOGGER_DEBUG, "ANNOUNCE: ALAC 44100/16/2, 352 samples per frame");
+finish_announce:
+    free(sdp);
+}
+
+static bool
+raop_transport_port(const char *transport, const char *name, unsigned short *port)
+{
+    const char *field = transport;
+    bool found = false;
+    while ((field = strchr(field, ';'))) {
+        field++;
+        while (*field == ' ' || *field == '\t') field++;
+        if (strncmp(field, name, strlen(name))) continue;
+        const char *value = field + strlen(name);
+        if (found || *value < '0' || *value > '9') return false;
+        char *end = NULL;
+        unsigned long number = strtoul(value, &end, 10);
+        while (*end == ' ' || *end == '\t') end++;
+        if (!number || number > 65535 || (*end && *end != ';')) return false;
+        *port = (unsigned short) number;
+        found = true;
+    }
+    return found;
+}
+
+static void
+raop_handler_setup_audio(raop_conn_t *conn, http_request_t *request,
+                         http_response_t *response, const char *transport)
+{
+    raop_t *raop = conn->raop;
+    if (!conn->audio_announced || conn->raop_rtp || conn->raop_ntp) {
+        http_response_init(response, "RTSP/1.0", 455, "Method Not Valid in This State");
+        return;
+    }
+    if (strncmp(transport, "RTP/AVP/UDP;", 12)) {
+        http_response_init(response, "RTSP/1.0", 461, "Unsupported Transport");
+        return;
+    }
+    unsigned short remote_cport = 0, remote_tport = 0;
+    if (!raop_transport_port(transport, "control_port=", &remote_cport) ||
+        !raop_transport_port(transport, "timing_port=", &remote_tport)) {
+        http_response_init(response, "RTSP/1.0", 400, "Bad Request");
+        return;
+    }
+    char remote[40] = {0};
+    if (!utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id, remote, sizeof(remote))) {
+        http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+        return;
+    }
+    timing_protocol_t protocol = TP_UNSPECIFIED;
+    unsigned short tport = raop->timing_lport, cport = raop->control_lport, dport = raop->data_lport;
+    conn->raop_ntp = raop_ntp_init(raop->logger, &raop->callbacks, remote,
+                                  conn->remotelen, remote_tport, &protocol);
+    if (!conn->raop_ntp) goto setup_audio_failed;
+    if (raop_ntp_start(conn->raop_ntp, &tport) < 0) goto setup_audio_failed;
+    conn->raop_rtp = raop_rtp_init(raop->logger, &raop->callbacks, conn->raop_ntp,
+                                  remote, conn->remotelen, conn->audio_key, conn->audio_iv);
+    if (!conn->raop_rtp) goto setup_audio_failed;
+    const char *dacp_id = http_request_get_header(request, "DACP-ID");
+    const char *active_remote = http_request_get_header(request, "Active-Remote");
+    if (dacp_id && active_remote) raop_rtp_remote_control_id(conn->raop_rtp, dacp_id, active_remote);
+    unsigned char ct = 2;
+    unsigned short spf = 352;
+    unsigned int sr = AUDIO_SAMPLE_RATE;
+    bool using_screen = false, is_media = true;
+    uint64_t audio_format = 0; /* SDP does not supply the plist audioFormat field. */
+    if (raop->callbacks.audio_get_format) {
+        raop->callbacks.audio_get_format(raop->callbacks.cls, &ct, &spf,
+                                         &using_screen, &is_media, &audio_format);
+    }
+    raop_rtp_start_audio(conn->raop_rtp, &remote_cport, &cport, &dport, &ct, &sr);
+    if (!raop_rtp_is_running(conn->raop_rtp)) goto setup_audio_failed;
+    char buffer[160];
+    snprintf(buffer, sizeof(buffer), "RTP/AVP/UDP;unicast;mode=record;server_port=%hu;control_port=%hu;timing_port=%hu",
+             dport, cport, tport);
+    http_response_add_header(response, "Transport", buffer);
+    http_response_add_header(response, "Session", "1");
+    return;
+setup_audio_failed:
+    raop_rtp_destroy(conn->raop_rtp);
+    conn->raop_rtp = NULL;
+    raop_ntp_destroy(conn->raop_ntp);
+    conn->raop_ntp = NULL;
+    http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+}
+
 static void
 raop_handler_setup(raop_conn_t *conn,
                    http_request_t *request, http_response_t *response,
                    char **response_data, int *response_datalen)
 {
+    const char *transport = http_request_get_header(request, "Transport");
+    if (transport) {
+        raop_handler_setup_audio(conn, request, response, transport);
+        return;
+    }
+    if (conn->audio_announced) {
+        http_response_init(response, "RTSP/1.0", 400, "Bad Request");
+        return;
+    }
     unsigned char aesiv[AES_IV_SIZE] = { 0 };
     unsigned char eaeskey[EKEY_SIZE] = { 0 };
     unsigned char aeskey[AES_KEY_SIZE] = { 0 };	
@@ -655,121 +1008,11 @@ raop_handler_setup(raop_conn_t *conn,
         plist_get_string_val(req_deviceid_node, &deviceID);  
 
 
-        /* RFC2617 Digest authentication (md5 hash) of uxplay client-access password, if set */
-        if (!conn->authenticated && raop->callbacks.passwd) {
-            size_t pin_len = 4;
-            const char *authorization = NULL;
-            authorization = http_request_get_header(request, "Authorization");
-            if (!authorization) {
-                // if random_pw is set, but client has changed, unset it 
-                if (raop->random_pw && strncmp(raop->random_pw + pin_len + 1,  deviceID, 17)) {
-                    free(raop->random_pw);
-                    raop->random_pw = NULL;
-                }
-            }
-            int len = 0;
-            const char *password = raop->callbacks.passwd(raop->callbacks.cls, &len);
-            // len = -1 means use a random password for this connection; len = 0 means no password
-            if (len == -1 && raop->random_pw && raop->auth_fail_count >= MAX_PW_ATTEMPTS) {
-                // change random_pw after MAX_PW_ATTEMPTS  failed authentication attempts
-                logger_log(raop->logger, LOGGER_INFO, "Too many authentication failures: generate new random password");
-                free(raop->random_pw);
-                raop->random_pw = NULL;
-            }
-            if (len == -1 && !raop->random_pw) {
-                // get and store 4 random digits
-                int pin_4  = random_pin();
-                if (pin_4 < 0) {
-                    logger_log(raop->logger, LOGGER_ERR, "Failed to generate random pin");
-                    pin_4 = 1234;
-                }
-                if ((raop->random_pw =  (char *) calloc(pin_len + 1 + 18, sizeof(char)))) {
-                    char *pin = raop->random_pw;
-                    snprintf(pin, pin_len + 1, "%04u", pin_4 % 10000);
-                    pin[pin_len] = '\0';
-                    snprintf(pin + pin_len + 1, 18, "%s", deviceID);
-                } else {
-                    logger_log(raop->logger, LOGGER_ERR, "Failed to allocate raop->random_pw");
-                }
-                raop->auth_fail_count = 0;
-            }
-            if (len == -1 && !authorization && raop->random_pw) {
-                if (raop->callbacks.display_pin) {
-                    raop->callbacks.display_pin(raop->callbacks.cls, raop->random_pw);
-                }
-                logger_log(raop->logger, LOGGER_INFO, "*** CLIENT MUST NOW ENTER PIN = \"%s\" AS AIRPLAY PASSWORD", raop->random_pw);
-                raop->auth_fail_count++;
-            }
-            if (len && !conn->authenticated) {
- 	        if (len == -1) {
-                    password = (const char *) raop->random_pw;
-                }
-                char nonce_string[33] = { '\0' };
-                //bool stale = false;  //not implemented
-                if (len && authorization) {
-                    const char *nonce = strstr(authorization, "nonce=\"");
-                    nonce = nonce ? nonce + strlen("nonce=\"") : NULL;
-                    if (nonce) {
-                        const char *end = strchr(nonce, '\"');
-                        if (end && end == nonce + 32) {
-                            strncpy(nonce_string, nonce, 32);
-                        }
-                    }
-                    const char *method = http_request_get_method(request);
-                    conn->authenticated = pairing_digest_verify(method, authorization, password);
-                    if (!conn->authenticated) {
-                        // if random_pw is used, the auth_fail_count will be the number of times it is displayed after creation
-                        if (len != -1) {
-                            raop->auth_fail_count++;
-                        }
-                        logger_log(raop->logger, LOGGER_INFO, "*** authentication failure: count = %u", raop->auth_fail_count);
-                    }
-                    if (conn->authenticated) {
-                        //printf("initial authenticatication OK\n");
-                        conn->authenticated = conn->authenticated && !strcmp(nonce_string, raop->nonce);
-                        if (!conn->authenticated) {
-                            logger_log(raop->logger, LOGGER_INFO, "authentication rejected (nonce mismatch) %s %s",
-                                       nonce_string, raop->nonce);
-                        }			
-                    }
-                    if (conn->authenticated && raop->random_pw) {
-                        free (raop->random_pw);
-                        raop->random_pw = NULL;
-                    }
-                    if (raop->nonce) {
-                        free(raop->nonce);
-                        raop->nonce = NULL;
-                    }
-                    logger_log(raop->logger, LOGGER_INFO, "Client authentication %s", (conn->authenticated ? "success" : "failure"));
-                }
-                if (!conn->authenticated) {
-                    /* create a nonce */
-                    const char *url = http_request_get_url(request);
-                    unsigned char nonce[16] = { '\0' };
-                    int len = 16;
-                    uint64_t now = raop_ntp_get_local_time();
-                    pairing_session_make_nonce(conn->session, &now, url, nonce, len);
-                    if (raop->nonce) {
-                        free(raop->nonce);
-                    }
-                    raop->nonce = utils_hex_to_string(nonce, len);
-                    char response_text[80] = "Digest realm=\"raop\", nonce=\"";
-                    strncat(response_text, raop->nonce, 80 - strlen(response_text) - 1);
-                    strncat(response_text, "\"", 80 - strlen(response_text) - 1);
-                    http_response_init(response, "RTSP/1.0", 401, "Unauthorized");
-                    http_response_add_header(response, "WWW-Authenticate", response_text);
-                    if (req_root_node) {
-                        plist_free(req_root_node);
-                    }
-                    if (res_root_node) {
-                        plist_free(res_root_node);
-                    }
-                    if (deviceID) {
-                        plist_mem_free(deviceID);
-                    }
-                    return;
-                }
-            }
+        if (!raop_handler_authorize(conn, request, response, deviceID)) {
+            plist_free(req_root_node);
+            plist_free(res_root_node);
+            plist_mem_free(deviceID);
+            return;
         }
 	
         char *model = NULL;
@@ -1294,6 +1537,21 @@ raop_handler_teardown(raop_conn_t *conn,
 {
     /* get the teardown request type(s):  (type 96, 110, or none) */
     raop_t *raop = conn->raop;
+    if (conn->audio_announced) {
+        raop_rtp_destroy(conn->raop_rtp);
+        conn->raop_rtp = NULL;
+        raop_ntp_destroy(conn->raop_ntp);
+        conn->raop_ntp = NULL;
+        conn->audio_announced = false;
+        memset(conn->audio_key, 0, sizeof(conn->audio_key));
+        memset(conn->audio_iv, 0, sizeof(conn->audio_iv));
+        if (raop->callbacks.audio_stop_coverart_rendering) {
+            raop->callbacks.audio_stop_coverart_rendering(raop->callbacks.cls);
+        }
+        http_response_add_header(response, "Connection", "close");
+        http_response_set_disconnect(response, 1);
+        return;
+    }
     const char *data = NULL;
     int data_len = 0;
     bool teardown_96 = false, teardown_110 = false;
