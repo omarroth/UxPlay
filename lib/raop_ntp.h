@@ -51,7 +51,7 @@ void *raop_ntp_thread_worker(void *param);
 
 typedef enum timing_protocol_e { NTP, TP_NONE, TP_OTHER, TP_UNSPECIFIED } timing_protocol_t;
 
-void raop_ntp_start(raop_ntp_t *raop_ntp, unsigned short *timing_lport);
+int raop_ntp_start(raop_ntp_t *raop_ntp, unsigned short *timing_lport);
 
 void raop_ntp_stop(raop_ntp_t *raop_ntp);
 

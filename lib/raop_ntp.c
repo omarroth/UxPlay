@@ -863,7 +863,7 @@ raop_ntp_thread(void *arg) {
     return 0;
 }
 
-void
+int
 raop_ntp_start(raop_ntp_t *raop_ntp, unsigned short *timing_lport)
 {
     logger_log(raop_ntp->logger, LOGGER_DEBUG, "raop_ntp starting time");
@@ -877,7 +877,7 @@ raop_ntp_start(raop_ntp_t *raop_ntp, unsigned short *timing_lport)
     MUTEX_LOCK(raop_ntp->run_mutex);
     if (raop_ntp->running || !raop_ntp->joined) {
         MUTEX_UNLOCK(raop_ntp->run_mutex);
-        return;
+        return -1;
     }
 
     /* Initialize ports and sockets */
@@ -888,7 +888,7 @@ raop_ntp_start(raop_ntp_t *raop_ntp, unsigned short *timing_lport)
     if (raop_ntp_init_socket(raop_ntp, use_ipv6) < 0) {
         logger_log(raop_ntp->logger, LOGGER_ERR, "raop_ntp initializing timing socket failed");
         MUTEX_UNLOCK(raop_ntp->run_mutex);
-        return;
+        return -1;
     }
     *timing_lport = raop_ntp->timing_lport;
 
@@ -898,6 +898,7 @@ raop_ntp_start(raop_ntp_t *raop_ntp, unsigned short *timing_lport)
     
     THREAD_CREATE(raop_ntp->thread, raop_ntp_thread, raop_ntp);
     MUTEX_UNLOCK(raop_ntp->run_mutex);
+    return 0;
 }
 
 void

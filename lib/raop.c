@@ -121,6 +121,11 @@ struct raop_conn_s {
     char *client_session_id;
     bool authenticated;
     bool have_active_remote;
+
+    /* Classic RAOP sends audio keys in ANNOUNCE, before transport SETUP. */
+    bool audio_announced;
+    unsigned char audio_key[RAOP_AESKEY_LEN];
+    unsigned char audio_iv[RAOP_AESIV_LEN];
 };
 typedef struct raop_conn_s raop_conn_t;
 
@@ -142,7 +147,11 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
     conn->raop_rtp = NULL;
     conn->raop_rtp_mirror = NULL;
     conn->raop_ntp = NULL;
-    conn->fairplay = fairplay_init(raop->logger);
+    int hw_addr_len = 0;
+    const char *hw_addr = dnssd_get_hw_addr(raop->dnssd, &hw_addr_len);
+    conn->fairplay = fairplay_init(raop->logger,
+                                   (const unsigned char *) hw_addr,
+                                   (size_t) hw_addr_len);
 
     if (!conn->fairplay) {
         free(conn);
@@ -426,6 +435,8 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             }
         } else if (!strcmp(method, "OPTIONS")) {
             handler = &raop_handler_options;
+        } else if (!strcmp(method, "ANNOUNCE")) {
+            handler = &raop_handler_announce;
         } else if (!strcmp(method, "SETUP")) {
             raop->hls_pending = false;
             handler = &raop_handler_setup;
