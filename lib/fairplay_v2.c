@@ -1,3 +1,17 @@
+/**
+ *  Copyright (C) 2026  Omar Roth
+ *
+ * This library is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation; either version 2.1 of the License, or
+ * (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public
+ * License for more details.
+ */
+
 /*
  * Clean-room AirPlay FairPlay selector-2 receiver primitives.
  *
@@ -16,7 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-struct fairplay_v2 {
+struct fairplay_v2_s {
     uint8_t receiver_sap[128];
     uint8_t sender_sap[128];
     uint8_t mode;
@@ -124,41 +138,53 @@ static const uint8_t wrapping_suffix[16] = {
     '5','7','b','v','&','%','n','i','u','l','q','p','d','g','3','z'
 };
 
-static uint8_t hex_nibble(char value)
+static uint8_t
+hex_nibble(char value)
 {
     if (value >= '0' && value <= '9') return (uint8_t)(value - '0');
-    if (value >= 'a' && value <= 'f') return (uint8_t)(value - 'a' + 10);
+    if (value >= 'a' && value <= 'f') {
+        return (uint8_t)(value - 'a' + 10);
+    }
     return 0xff;
 }
 
-static int decode_round_keys(uint8_t mode, uint8_t keys[11][16])
+static int
+decode_round_keys(uint8_t mode, uint8_t keys[11][16])
 {
     const char *encoded;
     size_t i;
 
-    if (mode >= 4) return FAIRPLAY_V2_INVALID;
+    if (mode >= 4) {
+        return FAIRPLAY_V2_INVALID;
+    }
     encoded = round_keys_hex[mode];
     for (i = 0; i < 11 * 16; i++) {
         uint8_t high = hex_nibble(encoded[2 * i]);
         uint8_t low = hex_nibble(encoded[2 * i + 1]);
-        if (high == 0xff || low == 0xff) return FAIRPLAY_V2_CRYPTO;
+        if (high == 0xff || low == 0xff) {
+            return FAIRPLAY_V2_CRYPTO;
+        }
         ((uint8_t *)keys)[i] = (uint8_t)((high << 4) | low);
     }
     return FAIRPLAY_V2_OK;
 }
 
-static uint8_t gf_multiply(uint8_t a, uint8_t b)
+static uint8_t
+gf_multiply(uint8_t a, uint8_t b)
 {
     uint8_t product = 0;
     while (b != 0) {
-        if ((b & 1) != 0) product ^= a;
+        if ((b & 1) != 0) {
+            product ^= a;
+        }
         a = (uint8_t)((a << 1) ^ ((a & 0x80) ? 0x1b : 0));
         b >>= 1;
     }
     return product;
 }
 
-static void shift_rows(uint8_t state[16])
+static void
+shift_rows(uint8_t state[16])
 {
     uint8_t previous[16];
     unsigned row, column;
@@ -170,7 +196,8 @@ static void shift_rows(uint8_t state[16])
     }
 }
 
-static void inverse_shift_rows(uint8_t state[16])
+static void
+inverse_shift_rows(uint8_t state[16])
 {
     uint8_t previous[16];
     unsigned row, column;
@@ -182,7 +209,8 @@ static void inverse_shift_rows(uint8_t state[16])
     }
 }
 
-static void mix_columns(uint8_t state[16])
+static void
+mix_columns(uint8_t state[16])
 {
     unsigned column;
     for (column = 0; column < 4; column++) {
@@ -196,112 +224,134 @@ static void mix_columns(uint8_t state[16])
     }
 }
 
-static void inverse_mix_columns(uint8_t state[16])
+static void
+inverse_mix_columns(uint8_t state[16])
 {
     unsigned column;
     for (column = 0; column < 4; column++) {
         unsigned offset = column * 4;
         uint8_t a = state[offset], b = state[offset + 1];
         uint8_t c = state[offset + 2], d = state[offset + 3];
-        state[offset] = gf_multiply(a, 14) ^ gf_multiply(b, 11) ^
-                        gf_multiply(c, 13) ^ gf_multiply(d, 9);
-        state[offset + 1] = gf_multiply(a, 9) ^ gf_multiply(b, 14) ^
-                            gf_multiply(c, 11) ^ gf_multiply(d, 13);
-        state[offset + 2] = gf_multiply(a, 13) ^ gf_multiply(b, 9) ^
-                            gf_multiply(c, 14) ^ gf_multiply(d, 11);
-        state[offset + 3] = gf_multiply(a, 11) ^ gf_multiply(b, 13) ^
-                            gf_multiply(c, 9) ^ gf_multiply(d, 14);
+        state[offset] = gf_multiply(a, 14) ^ gf_multiply(b, 11) ^ gf_multiply(c, 13) ^ gf_multiply(d, 9);
+        state[offset + 1] = gf_multiply(a, 9) ^ gf_multiply(b, 14) ^ gf_multiply(c, 11) ^ gf_multiply(d, 13);
+        state[offset + 2] = gf_multiply(a, 13) ^ gf_multiply(b, 9) ^ gf_multiply(c, 14) ^ gf_multiply(d, 11);
+        state[offset + 3] = gf_multiply(a, 11) ^ gf_multiply(b, 13) ^ gf_multiply(c, 9) ^ gf_multiply(d, 14);
     }
 }
 
-static void xor_key(uint8_t state[16], const uint8_t key[16])
+static void
+xor_key(uint8_t state[16], const uint8_t key[16])
 {
     unsigned i;
-    for (i = 0; i < 16; i++) state[i] ^= key[i];
+    for (i = 0; i < 16; i++) {
+        state[i] ^= key[i];
+    }
 }
 
-static void encrypt_block(uint8_t state[16], const uint8_t keys[11][16])
+static void
+encrypt_block(uint8_t state[16], const uint8_t keys[11][16])
 {
     unsigned round, i;
     xor_key(state, keys[0]);
-    for (i = 0; i < 16; i++) state[i] = aes_sbox[state[i]];
+    for (i = 0; i < 16; i++) {
+        state[i] = aes_sbox[state[i]];
+    }
     shift_rows(state);
     for (round = 1; round < 10; round++) {
         mix_columns(state);
         xor_key(state, keys[round]);
-        for (i = 0; i < 16; i++) state[i] = aes_sbox[state[i]];
+        for (i = 0; i < 16; i++) {
+            state[i] = aes_sbox[state[i]];
+        }
         shift_rows(state);
     }
     xor_key(state, keys[10]);
 }
 
-static void decrypt_block(uint8_t state[16], const uint8_t keys[11][16],
-                          const uint8_t inverse_sbox[256])
+static void
+decrypt_block(uint8_t state[16], const uint8_t keys[11][16], const uint8_t inverse_sbox[256])
 {
     int round;
     unsigned i;
     xor_key(state, keys[10]);
     for (round = 9; round > 0; round--) {
         inverse_shift_rows(state);
-        for (i = 0; i < 16; i++) state[i] = inverse_sbox[state[i]];
+        for (i = 0; i < 16; i++) {
+            state[i] = inverse_sbox[state[i]];
+        }
         xor_key(state, keys[round]);
         inverse_mix_columns(state);
     }
     inverse_shift_rows(state);
-    for (i = 0; i < 16; i++) state[i] = inverse_sbox[state[i]];
+    for (i = 0; i < 16; i++) {
+        state[i] = inverse_sbox[state[i]];
+    }
     xor_key(state, keys[0]);
 }
 
-int fairplay_v2_encrypt_sap(uint8_t mode, const uint8_t plaintext[128],
-                            uint8_t encrypted[128])
+static int
+fairplay_v2_encrypt_sap(uint8_t mode, const uint8_t plaintext[128], uint8_t encrypted[128])
 {
     uint8_t keys[11][16], previous[16] = {0};
     unsigned block, i;
     int result;
 
-    if (plaintext == NULL || encrypted == NULL || mode >= 4)
+    if (plaintext == NULL || encrypted == NULL || mode >= 4) {
         return FAIRPLAY_V2_INVALID;
+    }
     result = decode_round_keys(mode, keys);
-    if (result != FAIRPLAY_V2_OK) return result;
+    if (result != FAIRPLAY_V2_OK) {
+        return result;
+    }
 
     for (block = 0; block < 8; block++) {
         uint8_t state[16];
         for (i = 0; i < 16; i++) {
             state[i] = plaintext[block * 16 + i] ^ input_masks[mode][i];
-            if (block > 0) state[i] ^= previous[i] ^ chain_masks[mode][i];
+            if (block > 0) {
+                state[i] ^= previous[i] ^ chain_masks[mode][i];
+            }
         }
         encrypt_block(state, keys);
         memcpy(previous, state, sizeof(previous));
-        for (i = 0; i < 16; i++)
+        for (i = 0; i < 16; i++) {
             encrypted[block * 16 + i] = state[i] ^ output_masks[mode][i];
+        }
     }
     OPENSSL_cleanse(keys, sizeof(keys));
     return FAIRPLAY_V2_OK;
 }
 
-int fairplay_v2_decrypt_sap(uint8_t mode, const uint8_t encrypted[128],
-                            uint8_t plaintext[128])
+static int
+fairplay_v2_decrypt_sap(uint8_t mode, const uint8_t encrypted[128], uint8_t plaintext[128])
 {
     uint8_t keys[11][16], inverse_sbox[256], previous[16] = {0};
     unsigned block, i;
     int result;
 
-    if (encrypted == NULL || plaintext == NULL || mode >= 4)
+    if (encrypted == NULL || plaintext == NULL || mode >= 4) {
         return FAIRPLAY_V2_INVALID;
+    }
     result = decode_round_keys(mode, keys);
-    if (result != FAIRPLAY_V2_OK) return result;
-    for (i = 0; i < 256; i++) inverse_sbox[aes_sbox[i]] = (uint8_t)i;
+    if (result != FAIRPLAY_V2_OK) {
+        return result;
+    }
+    for (i = 0; i < 256; i++) {
+        inverse_sbox[aes_sbox[i]] = (uint8_t)i;
+    }
 
     for (block = 0; block < 8; block++) {
         uint8_t state[16], current[16];
-        for (i = 0; i < 16; i++)
+        for (i = 0; i < 16; i++) {
             state[i] = encrypted[block * 16 + i] ^ output_masks[mode][i];
+        }
         memcpy(current, state, sizeof(current));
         decrypt_block(state, keys, inverse_sbox);
         for (i = 0; i < 16; i++) {
             plaintext[block * 16 + i] = state[i] ^ input_masks[mode][i];
-            if (block > 0)
+            if (block > 0) {
                 plaintext[block * 16 + i] ^= previous[i] ^ chain_masks[mode][i];
+            }
         }
         memcpy(previous, current, sizeof(previous));
     }
@@ -310,13 +360,14 @@ int fairplay_v2_decrypt_sap(uint8_t mode, const uint8_t encrypted[128],
     return FAIRPLAY_V2_OK;
 }
 
-static uint32_t load_be32(const uint8_t input[4])
+static uint32_t
+load_be32(const uint8_t input[4])
 {
-    return ((uint32_t)input[0] << 24) | ((uint32_t)input[1] << 16) |
-           ((uint32_t)input[2] << 8) | input[3];
+    return ((uint32_t)input[0] << 24) | ((uint32_t)input[1] << 16) | ((uint32_t)input[2] << 8) | input[3];
 }
 
-static void store_be32(uint8_t output[4], uint32_t value)
+static void
+store_be32(uint8_t output[4], uint32_t value)
 {
     output[0] = (uint8_t)(value >> 24);
     output[1] = (uint8_t)(value >> 16);
@@ -324,16 +375,15 @@ static void store_be32(uint8_t output[4], uint32_t value)
     output[3] = (uint8_t)value;
 }
 
-static int valid_record(const uint8_t *record, uint8_t type,
-                        uint32_t payload_length)
+static int
+valid_record(const uint8_t *record, uint8_t type, uint32_t payload_length)
 {
-    return memcmp(record, "FPLY", 4) == 0 && record[4] == 2 &&
-           record[5] == 1 && record[6] == type && record[7] == 0 &&
+    return memcmp(record, "FPLY", 4) == 0 && record[4] == 2 && record[5] == 1 && record[6] == type && record[7] == 0 &&
            load_be32(record + 8) == payload_length;
 }
 
-static void record_header(uint8_t *record, uint8_t type,
-                          uint32_t payload_length)
+static void
+record_header(uint8_t *record, uint8_t type, uint32_t payload_length)
 {
     memcpy(record, "FPLY", 4);
     record[4] = 2;
@@ -343,71 +393,70 @@ static void record_header(uint8_t *record, uint8_t type,
     store_be32(record + 8, payload_length);
 }
 
-static int derive_mac_key(const uint8_t sender_sap[128],
-                          const uint8_t receiver_sap[128], uint8_t key[20])
+static int
+derive_mac_key(const uint8_t sender_sap[128], const uint8_t receiver_sap[128], uint8_t key[20])
 {
     EVP_MD_CTX *digest = EVP_MD_CTX_new();
     unsigned length = 0;
     int ok;
-    if (digest == NULL) return FAIRPLAY_V2_NOMEM;
+    if (digest == NULL) {
+        return FAIRPLAY_V2_NOMEM;
+    }
     ok = EVP_DigestInit_ex(digest, EVP_sha1(), NULL) == 1 &&
          EVP_DigestUpdate(digest, mac_prefix, sizeof(mac_prefix)) == 1 &&
-         EVP_DigestUpdate(digest, sender_sap, 128) == 1 &&
-         EVP_DigestUpdate(digest, receiver_sap, 128) == 1 &&
+         EVP_DigestUpdate(digest, sender_sap, 128) == 1 && EVP_DigestUpdate(digest, receiver_sap, 128) == 1 &&
          EVP_DigestUpdate(digest, mac_suffix, sizeof(mac_suffix)) == 1 &&
          EVP_DigestFinal_ex(digest, key, &length) == 1 && length == 20;
     EVP_MD_CTX_free(digest);
     return ok ? FAIRPLAY_V2_OK : FAIRPLAY_V2_CRYPTO;
 }
 
-static int derive_wrapping_key(const uint8_t sender_sap[128],
-                               const uint8_t receiver_sap[128],
-                               uint8_t key[16])
+static int
+derive_wrapping_key(const uint8_t sender_sap[128], const uint8_t receiver_sap[128], uint8_t key[16])
 {
     EVP_MD_CTX *digest = EVP_MD_CTX_new();
     unsigned length = 0;
     int ok;
-    if (digest == NULL) return FAIRPLAY_V2_NOMEM;
+    if (digest == NULL) {
+        return FAIRPLAY_V2_NOMEM;
+    }
     ok = EVP_DigestInit_ex(digest, EVP_md5(), NULL) == 1 &&
-         EVP_DigestUpdate(digest, wrapping_prefix,
-                          sizeof(wrapping_prefix)) == 1 &&
-         EVP_DigestUpdate(digest, sender_sap, 128) == 1 &&
-         EVP_DigestUpdate(digest, receiver_sap, 128) == 1 &&
-         EVP_DigestUpdate(digest, wrapping_suffix,
-                          sizeof(wrapping_suffix)) == 1 &&
+         EVP_DigestUpdate(digest, wrapping_prefix, sizeof(wrapping_prefix)) == 1 &&
+         EVP_DigestUpdate(digest, sender_sap, 128) == 1 && EVP_DigestUpdate(digest, receiver_sap, 128) == 1 &&
+         EVP_DigestUpdate(digest, wrapping_suffix, sizeof(wrapping_suffix)) == 1 &&
          EVP_DigestFinal_ex(digest, key, &length) == 1 && length == 16;
     EVP_MD_CTX_free(digest);
     return ok ? FAIRPLAY_V2_OK : FAIRPLAY_V2_CRYPTO;
 }
 
-static int decrypt_wrapped_block(const uint8_t key[16],
-                                 const uint8_t encrypted[16],
-                                 uint8_t plaintext[16])
+static int
+decrypt_wrapped_block(const uint8_t key[16], const uint8_t encrypted[16], uint8_t plaintext[16])
 {
     EVP_CIPHER_CTX *cipher = EVP_CIPHER_CTX_new();
     int written = 0, final_written = 0;
     int ok;
-    if (cipher == NULL) return FAIRPLAY_V2_NOMEM;
+    if (cipher == NULL) {
+        return FAIRPLAY_V2_NOMEM;
+    }
     ok = EVP_DecryptInit_ex(cipher, EVP_aes_128_ecb(), NULL, key, NULL) == 1 &&
          EVP_CIPHER_CTX_set_padding(cipher, 0) == 1 &&
-         EVP_DecryptUpdate(cipher, plaintext, &written, encrypted, 16) == 1 &&
-         written == 16 &&
-         EVP_DecryptFinal_ex(cipher, plaintext + written, &final_written) == 1 &&
-         final_written == 0;
+         EVP_DecryptUpdate(cipher, plaintext, &written, encrypted, 16) == 1 && written == 16 &&
+         EVP_DecryptFinal_ex(cipher, plaintext + written, &final_written) == 1 && final_written == 0;
     EVP_CIPHER_CTX_free(cipher);
     return ok ? FAIRPLAY_V2_OK : FAIRPLAY_V2_CRYPTO;
 }
 
-static int confirmation(const uint8_t sender_sap[128],
-                        const uint8_t receiver_sap[128], uint8_t output[20])
+static int
+confirmation(const uint8_t sender_sap[128], const uint8_t receiver_sap[128], uint8_t output[20])
 {
     static const uint8_t input[2] = {2, 2};
     uint8_t key[20];
     unsigned length = 0;
     int result = derive_mac_key(sender_sap, receiver_sap, key);
-    if (result != FAIRPLAY_V2_OK) return result;
-    if (HMAC(EVP_sha1(), key, sizeof(key), input, sizeof(input), output,
-             &length) == NULL || length != 20) {
+    if (result != FAIRPLAY_V2_OK) {
+        return result;
+    }
+    if (HMAC(EVP_sha1(), key, sizeof(key), input, sizeof(input), output, &length) == NULL || length != 20) {
         OPENSSL_cleanse(key, sizeof(key));
         return FAIRPLAY_V2_CRYPTO;
     }
@@ -415,29 +464,23 @@ static int confirmation(const uint8_t sender_sap[128],
     return FAIRPLAY_V2_OK;
 }
 
-fairplay_v2_t *fairplay_v2_new_with_receiver_sap(
-    const uint8_t receiver_sap[128])
+fairplay_v2_t *
+fairplay_v2_init(void)
 {
-    fairplay_v2_t *fairplay;
-    if (receiver_sap == NULL) return NULL;
-    fairplay = (fairplay_v2_t *)calloc(1, sizeof(*fairplay));
-    if (fairplay != NULL)
-        memcpy(fairplay->receiver_sap, receiver_sap, 128);
+    fairplay_v2_t *fairplay = calloc(1, sizeof(fairplay_v2_t));
+    if (!fairplay) {
+        return NULL;
+    }
+    fairplay->receiver_sap[1] = 1;
+    if (RAND_bytes(fairplay->receiver_sap + 2, 126) != 1) {
+        fairplay_v2_destroy(fairplay);
+        return NULL;
+    }
     return fairplay;
 }
 
-fairplay_v2_t *fairplay_v2_new(void)
-{
-    uint8_t receiver_sap[128] = {0};
-    fairplay_v2_t *fairplay;
-    receiver_sap[1] = 1;
-    if (RAND_bytes(receiver_sap + 2, 126) != 1) return NULL;
-    fairplay = fairplay_v2_new_with_receiver_sap(receiver_sap);
-    OPENSSL_cleanse(receiver_sap, sizeof(receiver_sap));
-    return fairplay;
-}
-
-void fairplay_v2_free(fairplay_v2_t *fairplay)
+void
+fairplay_v2_destroy(fairplay_v2_t *fairplay)
 {
     if (fairplay != NULL) {
         OPENSSL_cleanse(fairplay, sizeof(*fairplay));
@@ -445,22 +488,28 @@ void fairplay_v2_free(fairplay_v2_t *fairplay)
     }
 }
 
-int fairplay_v2_setup(fairplay_v2_t *fairplay,
-                      const uint8_t request[16], uint8_t response[142])
+int
+fairplay_v2_setup(fairplay_v2_t *fairplay, const uint8_t request[16], uint8_t response[142])
 {
     int result;
-    if (fairplay == NULL || request == NULL || response == NULL ||
-        !valid_record(request, 1, 4) || request[12] != 2 ||
-        request[13] != 0 || request[14] >= 4 || request[15] != 0xbb)
+    if (fairplay != NULL) {
+        fairplay->has_setup = 0;
+        fairplay->has_handshake = 0;
+        OPENSSL_cleanse(fairplay->sender_sap, sizeof(fairplay->sender_sap));
+    }
+    if (fairplay == NULL || request == NULL || response == NULL || !valid_record(request, 1, 4) || request[12] != 2 ||
+        request[13] != 0 || request[14] >= 4 || request[15] != 0xbb) {
         return FAIRPLAY_V2_INVALID;
+    }
 
     memset(response, 0, 142);
     record_header(response, 2, 130);
     response[12] = 2;
     response[13] = request[14];
-    result = fairplay_v2_encrypt_sap(request[14], fairplay->receiver_sap,
-                                     response + 14);
-    if (result != FAIRPLAY_V2_OK) return result;
+    result = fairplay_v2_encrypt_sap(request[14], fairplay->receiver_sap, response + 14);
+    if (result != FAIRPLAY_V2_OK) {
+        return result;
+    }
     fairplay->mode = request[14];
     fairplay->has_setup = 1;
     fairplay->has_handshake = 0;
@@ -468,25 +517,29 @@ int fairplay_v2_setup(fairplay_v2_t *fairplay,
     return FAIRPLAY_V2_OK;
 }
 
-int fairplay_v2_handshake(fairplay_v2_t *fairplay,
-                          const uint8_t request[164], uint8_t response[32])
+int
+fairplay_v2_handshake(fairplay_v2_t *fairplay, const uint8_t request[164], uint8_t response[32])
 {
     uint8_t expected[20];
     int result;
-    if (fairplay == NULL || request == NULL || response == NULL ||
-        !fairplay->has_setup || !valid_record(request, 3, 152) ||
-        request[12] != fairplay->mode ||
-        memcmp(request + 13, "\x8f\x1a\x9c", 3) != 0)
+    if (fairplay != NULL) {
+        fairplay->has_handshake = 0;
+        OPENSSL_cleanse(fairplay->sender_sap, sizeof(fairplay->sender_sap));
+    }
+    if (fairplay == NULL || request == NULL || response == NULL || !fairplay->has_setup ||
+        !valid_record(request, 3, 152) || request[12] != fairplay->mode ||
+        memcmp(request + 13, "\x8f\x1a\x9c", 3) != 0) {
         return FAIRPLAY_V2_INVALID;
+    }
 
-    fairplay->has_handshake = 0;
-
-    result = fairplay_v2_decrypt_sap(fairplay->mode, request + 16,
-                                     fairplay->sender_sap);
-    if (result != FAIRPLAY_V2_OK) return result;
-    result = confirmation(fairplay->sender_sap, fairplay->receiver_sap,
-                          expected);
-    if (result != FAIRPLAY_V2_OK) return result;
+    result = fairplay_v2_decrypt_sap(fairplay->mode, request + 16, fairplay->sender_sap);
+    if (result != FAIRPLAY_V2_OK) {
+        return result;
+    }
+    result = confirmation(fairplay->sender_sap, fairplay->receiver_sap, expected);
+    if (result != FAIRPLAY_V2_OK) {
+        return result;
+    }
     if (CRYPTO_memcmp(expected, request + 144, sizeof(expected)) != 0) {
         OPENSSL_cleanse(expected, sizeof(expected));
         OPENSSL_cleanse(fairplay->sender_sap, sizeof(fairplay->sender_sap));
@@ -500,9 +553,8 @@ int fairplay_v2_handshake(fairplay_v2_t *fairplay,
     return FAIRPLAY_V2_OK;
 }
 
-int fairplay_v2_decrypt_key(fairplay_v2_t *fairplay,
-                            const uint8_t encrypted_key[72],
-                            uint8_t raw_key[16])
+int
+fairplay_v2_decrypt_key(fairplay_v2_t *fairplay, const uint8_t encrypted_key[72], uint8_t raw_key[16])
 {
     uint8_t wrapping_key[16] = {0}, mac_key[20] = {0}, recovered[16] = {0};
     uint8_t authenticated[52] = {0}, expected[20] = {0};
@@ -510,33 +562,38 @@ int fairplay_v2_decrypt_key(fairplay_v2_t *fairplay,
     unsigned i;
     int result;
 
-    if (raw_key == NULL)
+    if (raw_key == NULL) {
         return FAIRPLAY_V2_INVALID;
+    }
     memset(raw_key, 0, 16);
-    if (fairplay == NULL || encrypted_key == NULL || !fairplay->has_handshake)
+    if (fairplay == NULL || encrypted_key == NULL || !fairplay->has_handshake) {
         return FAIRPLAY_V2_INVALID;
-    if (memcmp(encrypted_key, "FPLY\x01\x02\x01\x00", 8) != 0 ||
-        load_be32(encrypted_key + 8) != 60 ||
-        load_be32(encrypted_key + 12) != 0 ||
-        load_be32(encrypted_key + 32) != 16)
+    }
+    if (memcmp(encrypted_key, "FPLY\x01\x02\x01\x00", 8) != 0 || load_be32(encrypted_key + 8) != 60 ||
+        load_be32(encrypted_key + 12) != 0 || load_be32(encrypted_key + 32) != 16) {
         return FAIRPLAY_V2_INVALID;
+    }
 
-    result = derive_wrapping_key(fairplay->sender_sap,
-                                 fairplay->receiver_sap, wrapping_key);
-    if (result != FAIRPLAY_V2_OK) goto cleanup;
-    result = decrypt_wrapped_block(wrapping_key, encrypted_key + 56,
-                                   recovered);
-    if (result != FAIRPLAY_V2_OK) goto cleanup;
-    for (i = 0; i < sizeof(recovered); i++)
+    result = derive_wrapping_key(fairplay->sender_sap, fairplay->receiver_sap, wrapping_key);
+    if (result != FAIRPLAY_V2_OK) {
+        goto cleanup;
+    }
+    result = decrypt_wrapped_block(wrapping_key, encrypted_key + 56, recovered);
+    if (result != FAIRPLAY_V2_OK) {
+        goto cleanup;
+    }
+    for (i = 0; i < sizeof(recovered); i++) {
         recovered[i] ^= encrypted_key[16 + i];
+    }
 
-    result = derive_mac_key(fairplay->sender_sap, fairplay->receiver_sap,
-                            mac_key);
-    if (result != FAIRPLAY_V2_OK) goto cleanup;
+    result = derive_mac_key(fairplay->sender_sap, fairplay->receiver_sap, mac_key);
+    if (result != FAIRPLAY_V2_OK) {
+        goto cleanup;
+    }
     memcpy(authenticated, encrypted_key, 36);
     memcpy(authenticated + 36, recovered, sizeof(recovered));
-    if (HMAC(EVP_sha1(), mac_key, sizeof(mac_key), authenticated,
-             sizeof(authenticated), expected, &expected_length) == NULL ||
+    if (HMAC(EVP_sha1(), mac_key, sizeof(mac_key), authenticated, sizeof(authenticated), expected, &expected_length) ==
+            NULL ||
         expected_length != sizeof(expected)) {
         result = FAIRPLAY_V2_CRYPTO;
         goto cleanup;

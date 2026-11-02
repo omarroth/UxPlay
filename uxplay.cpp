@@ -1,6 +1,7 @@
 /**
  * RPiPlay - An open-source AirPlay mirroring server for Raspberry Pi
  * Copyright (C) 2019 Florian Draschbacher
+ * Copyright (C) 2026  Omar Roth
  * Modified extensively to become 
  * UxPlay - An open-souce AirPlay mirroring server.
  * Modifications Copyright (C) 2021-23 F. Duncanh
@@ -26,6 +27,8 @@
 #include <ctype.h>
 #include <string>
 #include <algorithm>
+#include <atomic>
+#include <climits>
 #include <vector>
 #include <array>
 #include <fstream>
@@ -195,7 +198,7 @@ static guint progress_id = 0;
 static guint gst_hls_position_id = 0;
 static bool preserve_connections = false;
 static guint missed_feedback_limit = MISSED_FEEDBACK_LIMIT;
-static guint missed_feedback = 0;
+static std::atomic<guint> missed_feedback(0);
 static guint playbin_version = DEFAULT_PLAYBIN_VERSION;
 static bool reset_httpd = false;
 static bool monitor_progress = false;
@@ -658,9 +661,10 @@ static void dump_video_to_file(unsigned char *data, int datalen) {
 
 static gboolean feedback_callback(gpointer loop) {
     if (open_connections) {
-        if (missed_feedback_limit && missed_feedback > missed_feedback_limit) {
+        guint silent_seconds = missed_feedback.load();
+        if (missed_feedback_limit && silent_seconds > missed_feedback_limit) {
             LOGI("***ERROR lost connection with client (network problem?)");
-            LOGI("   Interval since last client feedback request exceeds limit of %u seconds", missed_feedback_limit);
+            LOGI("   Interval since last client activity exceeds limit of %u seconds", missed_feedback_limit);
             LOGI("   Sometimes the network connection may recover after a longer delay:\n"
                  "   the default limit n = %d seconds, can be changed with the \"-reset n\" option", MISSED_FEEDBACK_LIMIT);
             if (!nofreeze) {
@@ -671,8 +675,9 @@ static gboolean feedback_callback(gpointer loop) {
             full_video_reset = true;
             g_main_loop_quit((GMainLoop *) loop);
             return TRUE;
-        } else if (missed_feedback > 2) {
-            LOGE("%3u seconds since last client feedback request (expected every two seconds); client may be offline", missed_feedback);
+        } else if (silent_seconds > 3) {
+            /* Classic RAOP timing replies normally arrive every three seconds. */
+            LOGE("%3u seconds since last client activity; client may be offline", silent_seconds);
         }
         missed_feedback++;
     } else {
@@ -2234,7 +2239,7 @@ static void parse_arguments (int argc, char *argv[]) {
 static void process_metadata(int count, const char *dmap_tag, const unsigned char* metadata, int datalen, std::string *metadata_text) {
     int dmap_type = 0;
     /* DMAP metadata items can be strings (dmap_type = 9); other types are byte, short, int, long, date, and list.  *
-     * The DMAP item begins with a 4-character (4-letter) "dmap_tag" string that identifies the type.               */
+     * The DMAP item begins with a 4-character alphanumeric "dmap_tag" string that identifies the type.         */
 
     if (debug_log) {
         printf("%d: dmap_tag [%s], %d\n", count, dmap_tag, datalen);
@@ -2380,18 +2385,19 @@ static int parse_dmap_header(const unsigned char *metadata, char *tag, int *len)
     bool istag = true;
     for (int i = 0; i < 4; i++) {
         tag[i] =  (char) *header;
-        if (!isalpha(tag[i])) {
+        if (!isalnum(*header)) {
             istag = false;
         }
         header++;
     }
 
-    *len = 0;
+    uint32_t datalen = 0;
     for (int i = 0; i < 4; i++) {
-        *len <<= 8;
-        *len += (int) *header;
+        datalen <<= 8;
+        datalen += *header;
         header++;
     }
+    *len = datalen <= INT_MAX ? (int) datalen : -1;
     if (!istag || *len < 0) {
         return 1;
     }
@@ -2739,7 +2745,7 @@ extern "C" void conn_destroy (void *cls) {
 }
 
 extern "C" void conn_feedback (void *cls) {
-    /* received client heartbeat signal: connection still exists */
+    /* Received client activity from the RTSP, RTP, or timing thread. */
     missed_feedback = 0;
 }
 
@@ -3026,6 +3032,10 @@ extern "C" void audio_set_metadata(void *cls, const void *buffer, int buflen) {
         }
         metadata += 8;
         buflen -= 8;
+        if (datalen > buflen) {
+            LOGE("received truncated metadata for tag [%s]: datalen %d > remaining %d", dmap_tag, datalen, buflen);
+            return;
+        }
         process_metadata(count, (const char *) dmap_tag, metadata, datalen, &metadata_text);
         metadata += datalen;
         buflen -= datalen;

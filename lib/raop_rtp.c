@@ -1,5 +1,6 @@
 /**
  *  Copyright (C) 2011-2012  Juho Vähä-Herttua
+ *  Copyright (C) 2026  Omar Roth
  *
  *  This library is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU Lesser General Public
@@ -606,6 +607,10 @@ raop_rtp_thread_udp(void *arg)
                     free (str);
                 }
                 continue;
+            }
+
+            if ((packet[0] & 0xc0) == 0x80 && raop_rtp->callbacks.conn_feedback) {
+                raop_rtp->callbacks.conn_feedback(raop_rtp->callbacks.cls);
             }
 
             if (!raop_rtp->initial_sync &&  raop_rtp->ct == 8 && video_arrival_offset) {
