@@ -104,6 +104,10 @@
 -   Support for running on Microsoft Windows (builds with the MinGW-64
     compiler in the unix-like MSYS2 environment).
 
+Audio-only streaming supports FairPlay v2 and v3, including the classic RAOP
+`ANNOUNCE`/`SETUP`/`RECORD` flow used by macOS Music. Classic RAOP currently
+supports ALAC at 44.1 kHz, 16-bit stereo, with 352 samples per frame.
+
 Note: AirPlay2 multi-room audio streaming is not supported: use
 [shairport-sync](https://github.com/mikebrady/shairport-sync) for that.
 
